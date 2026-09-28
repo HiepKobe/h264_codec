@@ -32,6 +32,7 @@ class _MyAppState extends State<MyApp> {
   int _totalH264Bytes = 0;
   bool _lastIsKeyFrame = false;
   int _lastDecodedYuvSize = 0;
+  int _currentBitrate = 2000000;
   String _statusText = 'Sẵn sàng ghi hình';
 
   static const int _width = 640;
@@ -74,7 +75,7 @@ class _MyAppState extends State<MyApp> {
       width: _width,
       height: _height,
       fps: 30,
-      bitrate: 2000000,
+      bitrate: _currentBitrate,
       pixelFormat: H264PixelFormat.nv21,
     );
 
@@ -127,21 +128,47 @@ class _MyAppState extends State<MyApp> {
     });
   }
 
+  /// Ép nén ra 1 IDR Keyframe ngay lập tức
+  void _forceKeyframe() {
+    if (_isRecording && _encoder != null) {
+      _encoder!.requestKeyframe();
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Đã yêu cầu Ép Keyframe (Force IDR NALU)'),
+          duration: Duration(milliseconds: 800),
+        ),
+      );
+    }
+  }
+
+  /// Đổi bitrate động (Adaptive Bitrate Realtime Test)
+  void _changeBitrate(int newBitrate) {
+    setState(() {
+      _currentBitrate = newBitrate;
+    });
+    if (_isRecording && _encoder != null) {
+      _encoder!.reconfigure(newBitrate: newBitrate);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Đã đổi Bitrate động: ${(newBitrate / 1000).toStringAsFixed(0)} Kbps'),
+          duration: const Duration(milliseconds: 800),
+        ),
+      );
+    }
+  }
+
   /// Giả lập 1 Frame ảnh thô NV21 từ Camera và chạy luồng Mã hóa -> Giải mã H.264
   void _processFrame() {
     if (!_isRecording || _encoder == null || _decoder == null) return;
 
     _frameCount++;
 
-    // 1. Tạo dữ liệu ảnh thô NV21 (Size = Width * Height * 1.5)
     final int frameSize = (_width * _height * 1.5).toInt();
     final Uint8List rawFrameData = Uint8List(frameSize);
 
-    // Điền pattern chuyển động theo thời gian
     final int fillByte = (_frameCount * 5) % 256;
     rawFrameData.fillRange(0, frameSize, fillByte);
 
-    // 2. Mã hóa Frame thô sang H.264 NAL Units
     final H264Frame? encodedFrame = _encoder!.encode(rawFrameData);
 
     if (encodedFrame != null) {
@@ -149,7 +176,6 @@ class _MyAppState extends State<MyApp> {
       _totalH264Bytes += encodedFrame.data.length;
       _lastIsKeyFrame = encodedFrame.isKeyFrame;
 
-      // 3. Giải mã ngay H.264 NAL Units về lại YUV Frame
       final DecodedYuvFrame? decodedFrame = _decoder!.decode(encodedFrame.data);
 
       if (decodedFrame != null) {
@@ -203,7 +229,7 @@ class _MyAppState extends State<MyApp> {
                       const SizedBox(width: 8),
                       Expanded(
                         child: Text(
-                          'Nền tảng: $_platformVersion\nĐộ phân giải: ${_width}x$_height (NV21)',
+                          'Nền tảng: $_platformVersion\nĐộ phân giải: ${_width}x$_height (NV21) @ ${(_currentBitrate / 1000).toStringAsFixed(0)} Kbps',
                           style: const TextStyle(fontWeight: FontWeight.w500),
                         ),
                       ),
@@ -293,6 +319,32 @@ class _MyAppState extends State<MyApp> {
                 ],
               ),
 
+              const SizedBox(height: 12),
+
+              // WebRTC Low-Latency / Dynamic Codec Control Buttons
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                alignment: WrapAlignment.center,
+                children: [
+                  ActionChip(
+                    avatar: const Icon(Icons.key, size: 16),
+                    label: const Text('Ép Keyframe (Force IDR)'),
+                    onPressed: _isRecording ? _forceKeyframe : null,
+                  ),
+                  ActionChip(
+                    avatar: const Icon(Icons.speed, size: 16),
+                    label: const Text('Bitrate 500 Kbps'),
+                    onPressed: _isRecording ? () => _changeBitrate(500000) : null,
+                  ),
+                  ActionChip(
+                    avatar: const Icon(Icons.high_quality, size: 16),
+                    label: const Text('Bitrate 4 Mbps'),
+                    onPressed: _isRecording ? () => _changeBitrate(4000000) : null,
+                  ),
+                ],
+              ),
+
               const SizedBox(height: 20),
 
               // Realtime Codec Statistics
@@ -365,9 +417,9 @@ class _MyAppState extends State<MyApp> {
     return Container(
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
-        color: color.withValues(alpha: 0.1),
+        color: color.withOpacity(0.1),
         borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: color.withValues(alpha: 0.3)),
+        border: Border.all(color: color.withOpacity(0.3)),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,

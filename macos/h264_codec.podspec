@@ -23,8 +23,13 @@ A new Flutter plugin project.
   # s.resource_bundles = {'h264_codec_privacy' => ['h264_codec/Sources/h264_codec/PrivacyInfo.xcprivacy']}
 
   s.dependency 'FlutterMacOS'
+  s.dependency 'libyuv'
+  s.frameworks = 'VideoToolbox', 'CoreMedia', 'CoreVideo'
 
   s.platform = :osx, '10.11'
-  s.pod_target_xcconfig = { 'DEFINES_MODULE' => 'YES' }
+  s.pod_target_xcconfig = {
+    'DEFINES_MODULE' => 'YES',
+    'GCC_PREPROCESSOR_DEFINITIONS' => '$(inherited) LIBYUV_NEON=1'
+  }
   s.swift_version = '5.0'
 end

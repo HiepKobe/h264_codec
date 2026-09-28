@@ -66,6 +66,18 @@ typedef DartEncodeFrameInstance = bool Function(
     ffi.Pointer<ffi.Bool> isKeyframe
 );
 
+typedef NativeRequestKeyframeInstance = ffi.Void Function(ffi.Pointer<ffi.Void> handle);
+typedef DartRequestKeyframeInstance = void Function(ffi.Pointer<ffi.Void> handle);
+
+typedef NativeReconfigureEncoderInstance = ffi.Bool Function(ffi.Pointer<ffi.Void> handle, ffi.Int32 newBitrate, ffi.Int32 newFps);
+typedef DartReconfigureEncoderInstance = bool Function(ffi.Pointer<ffi.Void> handle, int newBitrate, int newFps);
+
+typedef NativePauseEncoderInstance = ffi.Bool Function(ffi.Pointer<ffi.Void> handle);
+typedef DartPauseEncoderInstance = bool Function(ffi.Pointer<ffi.Void> handle);
+
+typedef NativeResumeEncoderInstance = ffi.Bool Function(ffi.Pointer<ffi.Void> handle);
+typedef DartResumeEncoderInstance = bool Function(ffi.Pointer<ffi.Void> handle);
+
 typedef NativeDestroyEncoderInstance = ffi.Void Function(ffi.Pointer<ffi.Void> handle);
 typedef DartDestroyEncoderInstance = void Function(ffi.Pointer<ffi.Void> handle);
 
@@ -90,6 +102,35 @@ typedef DartDecodeFrameInstance = bool Function(
 typedef NativeDestroyDecoderInstance = ffi.Void Function(ffi.Pointer<ffi.Void> handle);
 typedef DartDestroyDecoderInstance = void Function(ffi.Pointer<ffi.Void> handle);
 
+typedef NativeProcessCameraFrameLibYuv = ffi.Bool Function(
+    ffi.Pointer<ffi.Uint8> srcY,
+    ffi.Int32 yStride,
+    ffi.Pointer<ffi.Uint8> srcUv,
+    ffi.Int32 uvStride,
+    ffi.Int32 width,
+    ffi.Int32 height,
+    ffi.Int32 format,
+    ffi.Int32 rotationDegrees,
+    ffi.Pointer<ffi.Pointer<ffi.Uint8>> outI420,
+    ffi.Pointer<ffi.Int32> outLength,
+    ffi.Pointer<ffi.Int32> outWidth,
+    ffi.Pointer<ffi.Int32> outHeight
+);
+typedef DartProcessCameraFrameLibYuv = bool Function(
+    ffi.Pointer<ffi.Uint8> srcY,
+    int yStride,
+    ffi.Pointer<ffi.Uint8> srcUv,
+    int uvStride,
+    int width,
+    int height,
+    int format,
+    int rotationDegrees,
+    ffi.Pointer<ffi.Pointer<ffi.Uint8>> outI420,
+    ffi.Pointer<ffi.Int32> outLength,
+    ffi.Pointer<ffi.Int32> outWidth,
+    ffi.Pointer<ffi.Int32> outHeight
+);
+
 /// Low-level FFI binding class responsible for loading dynamic library and exposing C functions.
 class H264FFIBindings {
   static final H264FFIBindings _instance = H264FFIBindings._internal();
@@ -109,10 +150,19 @@ class H264FFIBindings {
   // Multi-Instance C API Functions
   late final DartCreateEncoderInstance createEncoderInstance;
   late final DartEncodeFrameInstance encodeFrameInstance;
+  late final DartRequestKeyframeInstance requestKeyframeInstance;
+  late final DartReconfigureEncoderInstance reconfigureEncoderInstance;
+  late final DartPauseEncoderInstance pauseEncoderInstance;
+  late final DartResumeEncoderInstance resumeEncoderInstance;
   late final DartDestroyEncoderInstance destroyEncoderInstance;
   late final DartCreateDecoderInstance createDecoderInstance;
   late final DartDecodeFrameInstance decodeFrameInstance;
   late final DartDestroyDecoderInstance destroyDecoderInstance;
+  late final DartProcessCameraFrameLibYuv processCameraFrameLibYuv;
+
+  // Finalizer pointers
+  late final ffi.Pointer<ffi.NativeFunction<NativeDestroyEncoderInstance>> destroyEncoderFinalizerPtr;
+  late final ffi.Pointer<ffi.NativeFunction<NativeDestroyDecoderInstance>> destroyDecoderFinalizerPtr;
 
   H264FFIBindings._internal() {
     nativeLib = _loadDynamicLibrary();
@@ -153,6 +203,22 @@ class H264FFIBindings {
         .lookup<ffi.NativeFunction<NativeEncodeFrameInstance>>('encode_frame_instance')
         .asFunction<DartEncodeFrameInstance>();
 
+    requestKeyframeInstance = nativeLib
+        .lookup<ffi.NativeFunction<NativeRequestKeyframeInstance>>('request_keyframe_instance')
+        .asFunction<DartRequestKeyframeInstance>();
+
+    reconfigureEncoderInstance = nativeLib
+        .lookup<ffi.NativeFunction<NativeReconfigureEncoderInstance>>('reconfigure_encoder_instance')
+        .asFunction<DartReconfigureEncoderInstance>();
+
+    pauseEncoderInstance = nativeLib
+        .lookup<ffi.NativeFunction<NativePauseEncoderInstance>>('pause_encoder_instance')
+        .asFunction<DartPauseEncoderInstance>();
+
+    resumeEncoderInstance = nativeLib
+        .lookup<ffi.NativeFunction<NativeResumeEncoderInstance>>('resume_encoder_instance')
+        .asFunction<DartResumeEncoderInstance>();
+
     destroyEncoderInstance = nativeLib
         .lookup<ffi.NativeFunction<NativeDestroyEncoderInstance>>('destroy_encoder_instance')
         .asFunction<DartDestroyEncoderInstance>();
@@ -168,6 +234,16 @@ class H264FFIBindings {
     destroyDecoderInstance = nativeLib
         .lookup<ffi.NativeFunction<NativeDestroyDecoderInstance>>('destroy_decoder_instance')
         .asFunction<DartDestroyDecoderInstance>();
+
+    processCameraFrameLibYuv = nativeLib
+        .lookup<ffi.NativeFunction<NativeProcessCameraFrameLibYuv>>('process_camera_frame_libyuv')
+        .asFunction<DartProcessCameraFrameLibYuv>();
+
+    destroyEncoderFinalizerPtr = nativeLib
+        .lookup<ffi.NativeFunction<NativeDestroyEncoderInstance>>('destroy_encoder_instance');
+
+    destroyDecoderFinalizerPtr = nativeLib
+        .lookup<ffi.NativeFunction<NativeDestroyDecoderInstance>>('destroy_decoder_instance');
   }
 
   static ffi.DynamicLibrary _loadDynamicLibrary() {
@@ -176,9 +252,17 @@ class H264FFIBindings {
     } else if (Platform.isIOS || Platform.isMacOS) {
       return ffi.DynamicLibrary.process();
     } else if (Platform.isWindows) {
-      return ffi.DynamicLibrary.open('h264_bridge.dll');
+      try {
+        return ffi.DynamicLibrary.open('h264_bridge.dll');
+      } catch (_) {
+        return ffi.DynamicLibrary.open('./h264_bridge.dll');
+      }
     } else if (Platform.isLinux) {
-      return ffi.DynamicLibrary.open('libh264_bridge.so');
+      try {
+        return ffi.DynamicLibrary.open('libh264_bridge.so');
+      } catch (_) {
+        return ffi.DynamicLibrary.open('./libh264_bridge.so');
+      }
     } else {
       throw UnsupportedError('Platform not supported for H.264 FFI Codec');
     }

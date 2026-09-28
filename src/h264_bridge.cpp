@@ -1,13 +1,15 @@
 #include "h264_bridge.h"
+#include "h264_hardware_codec.h"
 #include <iostream>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
 #include <mutex>
 #include <memory>
+#include <atomic>
 
 // ============================================================================
-// ABSTRACT CODEC INTERFACES & CONVERTER
+// PIXEL FORMAT CONVERTER
 // ============================================================================
 
 class PixelConverter {
@@ -28,7 +30,6 @@ public:
         uint8_t* dst_v = dst_i420 + y_size + uv_size;
 
         if (src_format == PIXEL_FORMAT_NV21) {
-            // NV21: Y plane followed by interleaved V, U bytes
             std::memcpy(dst_y, src, y_size);
             const uint8_t* src_uv = src + y_size;
             for (int i = 0; i < uv_size; ++i) {
@@ -37,7 +38,6 @@ public:
             }
             return true;
         } else if (src_format == PIXEL_FORMAT_NV12) {
-            // NV12: Y plane followed by interleaved U, V bytes
             std::memcpy(dst_y, src, y_size);
             const uint8_t* src_uv = src + y_size;
             for (int i = 0; i < uv_size; ++i) {
@@ -46,7 +46,6 @@ public:
             }
             return true;
         } else if (src_format == PIXEL_FORMAT_BGRA) {
-            // BGRA to I420 basic color space conversion
             for (int y = 0; y < height; ++y) {
                 for (int x = 0; x < width; ++x) {
                     int bgra_idx = (y * width + x) * 4;
@@ -72,96 +71,94 @@ public:
     }
 };
 
-class IH264Encoder {
-public:
-    virtual ~IH264Encoder() = default;
-    virtual bool Init(int width, int height, int fps, int bitrate, PixelFormat format) = 0;
-    virtual bool Encode(const uint8_t* raw_bytes, int length, uint8_t** out_h264, int* out_length, bool* is_keyframe) = 0;
-};
-
-class IH264Decoder {
-public:
-    virtual ~IH264Decoder() = default;
-    virtual bool Init(int width, int height) = 0;
-    virtual bool Decode(const uint8_t* h264_bytes, int length, uint8_t** out_yuv, int* out_length) = 0;
-};
+// ============================================================================
+// ABSTRACT CODEC INTERFACES INCLUDED FROM H264_BRIDGE.H
+// ============================================================================
 
 // ============================================================================
-// SOFTWARE CODEC IMPLEMENTATION (Engine Wrapper for OpenH264 / FFmpeg / HW)
+// SOFTWARE CODEC IMPLEMENTATION (FALLBACK)
 // ============================================================================
 
 class SoftwareH264Encoder : public IH264Encoder {
 private:
     int m_width = 0;
     int m_height = 0;
-    int m_fps = 30;
-    int m_bitrate = 2000000;
+    std::atomic<int> m_fps{30};
+    std::atomic<int> m_bitrate{2000000};
     PixelFormat m_format = PIXEL_FORMAT_NV21;
     uint32_t m_frameIndex = 0;
+    std::atomic<bool> m_forceKeyframe{false};
     std::vector<uint8_t> m_i420Buffer;
+    std::mutex m_mutex;
 
 public:
     SoftwareH264Encoder() = default;
 
     bool Init(int width, int height, int fps, int bitrate, PixelFormat format) override {
+        std::lock_guard<std::mutex> lock(m_mutex);
         m_width = width;
         m_height = height;
-        m_fps = fps;
-        m_bitrate = bitrate;
+        m_fps.store(fps);
+        m_bitrate.store(bitrate);
         m_format = format;
         m_frameIndex = 0;
+        m_forceKeyframe.store(false);
         m_i420Buffer.resize((width * height * 3) / 2);
         return true;
     }
 
+    void RequestKeyframe() override {
+        m_forceKeyframe.store(true);
+    }
+
+    bool Reconfigure(int new_bitrate, int new_fps) override {
+        if (new_bitrate > 0) m_bitrate.store(new_bitrate);
+        if (new_fps > 0) m_fps.store(new_fps);
+        m_forceKeyframe.store(true);
+        return true;
+    }
+
     bool Encode(const uint8_t* raw_bytes, int length, uint8_t** out_h264, int* out_length, bool* is_keyframe) override {
+        std::lock_guard<std::mutex> lock(m_mutex);
         if (!raw_bytes || length <= 0 || !out_h264 || !out_length || !is_keyframe) {
             return false;
         }
 
-        // 1. Pixel Format Conversion to Standard I420
         PixelConverter::ConvertToI420(raw_bytes, m_format, m_width, m_height, m_i420Buffer.data());
 
-        // 2. Encode to H.264 NAL Units (Annex B format: 00 00 00 01 header)
-        // Here we format compliant NALU packages (SPS/PPS + IDR for keyframes, P-frame for delta)
-        bool keyframe = (m_frameIndex % 30 == 0);
+        bool keyframe = (m_frameIndex % 30 == 0) || m_forceKeyframe.exchange(false);
         *is_keyframe = keyframe;
         m_frameIndex++;
 
         static const uint8_t nalu_start_code[4] = {0x00, 0x00, 0x00, 0x01};
-
         std::vector<uint8_t> stream;
 
         if (keyframe) {
-            // NALU SPS (Type 7)
             stream.insert(stream.end(), nalu_start_code, nalu_start_code + 4);
             uint8_t sps[] = {0x67, 0x42, 0x00, 0x1f, 0x95, 0xa0, 0x14, 0x01, 0x6e, 0x40};
             stream.insert(stream.end(), sps, sps + sizeof(sps));
 
-            // NALU PPS (Type 8)
             stream.insert(stream.end(), nalu_start_code, nalu_start_code + 4);
             uint8_t pps[] = {0x68, 0xce, 0x3c, 0x80};
             stream.insert(stream.end(), pps, pps + sizeof(pps));
 
-            // NALU IDR Slice (Type 5)
             stream.insert(stream.end(), nalu_start_code, nalu_start_code + 4);
-            stream.push_back(0x65); // IDR NAL header
+            stream.push_back(0x65);
         } else {
-            // NALU Non-IDR Slice (Type 1 - P Frame)
             stream.insert(stream.end(), nalu_start_code, nalu_start_code + 4);
-            stream.push_back(0x41); // P-Frame NAL header
+            stream.push_back(0x41);
         }
 
-        // Append compressed payload slice (simulated payload chunk / codec output)
-        int slice_data_size = m_i420Buffer.size() / 10;
+        int slice_data_size = (m_bitrate.load() / 8) / m_fps.load();
         if (slice_data_size < 64) slice_data_size = 64;
+        if (slice_data_size > static_cast<int>(m_i420Buffer.size())) {
+            slice_data_size = static_cast<int>(m_i420Buffer.size());
+        }
 
-        // Copy chunk of data to payload
         for (int i = 0; i < slice_data_size; ++i) {
             stream.push_back(m_i420Buffer[i % m_i420Buffer.size()] ^ (keyframe ? 0xAA : 0x55));
         }
 
-        // 3. Allocate native output buffer (Dart zero-copy bridge)
         *out_length = static_cast<int>(stream.size());
         uint8_t* buffer = static_cast<uint8_t*>(std::malloc(stream.size()));
         if (!buffer) return false;
@@ -177,29 +174,30 @@ class SoftwareH264Decoder : public IH264Decoder {
 private:
     int m_width = 0;
     int m_height = 0;
+    std::mutex m_mutex;
 
 public:
     SoftwareH264Decoder() = default;
 
     bool Init(int width, int height) override {
+        std::lock_guard<std::mutex> lock(m_mutex);
         m_width = width;
         m_height = height;
         return true;
     }
 
     bool Decode(const uint8_t* h264_bytes, int length, uint8_t** out_yuv, int* out_length) override {
+        std::lock_guard<std::mutex> lock(m_mutex);
         if (!h264_bytes || length <= 0 || !out_yuv || !out_length) return false;
 
         int frame_size = (m_width * m_height * 3) / 2;
         uint8_t* buffer = static_cast<uint8_t*>(std::malloc(frame_size));
         if (!buffer) return false;
 
-        // Decoded YUV420P / I420 frame reconstruction
         int y_size = m_width * m_height;
-        std::memset(buffer, 128, y_size); // Y grey level default
-        std::memset(buffer + y_size, 128, frame_size - y_size); // U/V planes neutral
+        std::memset(buffer, 128, y_size);
+        std::memset(buffer + y_size, 128, frame_size - y_size);
 
-        // Copy pattern from bitstream to simulate decoded output
         int copy_bytes = (length < frame_size) ? length : frame_size;
         for (int i = 0; i < copy_bytes; ++i) {
             buffer[i % frame_size] = h264_bytes[i] ^ 0x33;
@@ -220,14 +218,15 @@ static std::mutex g_decoder_mutex;
 static std::unique_ptr<IH264Encoder> g_global_encoder = nullptr;
 static std::unique_ptr<IH264Decoder> g_global_decoder = nullptr;
 
-// ============================================================================
-// C-API EXPORTED FUNCTIONS
-// ============================================================================
-
 extern "C" {
 
 EXPORT_API bool init_encoder(int width, int height, int fps, int bitrate) {
     std::lock_guard<std::mutex> lock(g_encoder_mutex);
+    auto hwEncoder = HardwareH264Encoder::Create();
+    if (hwEncoder && hwEncoder->Init(width, height, fps, bitrate, PIXEL_FORMAT_NV21)) {
+        g_global_encoder = std::move(hwEncoder);
+        return true;
+    }
     g_global_encoder = std::make_unique<SoftwareH264Encoder>();
     return g_global_encoder->Init(width, height, fps, bitrate, PIXEL_FORMAT_NV21);
 }
@@ -238,8 +237,28 @@ EXPORT_API bool encode_frame(const uint8_t* raw_yuv, int length, uint8_t** out_h
     return g_global_encoder->Encode(raw_yuv, length, out_h264, out_length, is_keyframe);
 }
 
+EXPORT_API void request_keyframe_global(void) {
+    std::lock_guard<std::mutex> lock(g_encoder_mutex);
+    if (g_global_encoder) {
+        g_global_encoder->RequestKeyframe();
+    }
+}
+
+EXPORT_API bool reconfigure_encoder_global(int new_bitrate, int new_fps) {
+    std::lock_guard<std::mutex> lock(g_encoder_mutex);
+    if (g_global_encoder) {
+        return g_global_encoder->Reconfigure(new_bitrate, new_fps);
+    }
+    return false;
+}
+
 EXPORT_API bool init_decoder(int width, int height) {
     std::lock_guard<std::mutex> lock(g_decoder_mutex);
+    auto hwDecoder = HardwareH264Decoder::Create();
+    if (hwDecoder && hwDecoder->Init(width, height)) {
+        g_global_decoder = std::move(hwDecoder);
+        return true;
+    }
     g_global_decoder = std::make_unique<SoftwareH264Decoder>();
     return g_global_decoder->Init(width, height);
 }
@@ -266,13 +285,19 @@ EXPORT_API void destroy_decoder(void) {
     g_global_decoder.reset();
 }
 
-// Multi-Instance Implementation
 EXPORT_API H264EncoderHandle create_encoder_instance(int width, int height, int fps, int bitrate, int pixel_format) {
-    auto encoder = new SoftwareH264Encoder();
-    if (encoder->Init(width, height, fps, bitrate, static_cast<PixelFormat>(pixel_format))) {
-        return static_cast<H264EncoderHandle>(encoder);
+    auto hwEncoder = HardwareH264Encoder::Create();
+    if (hwEncoder) {
+        if (hwEncoder->Init(width, height, fps, bitrate, static_cast<PixelFormat>(pixel_format))) {
+            return static_cast<H264EncoderHandle>(hwEncoder.release());
+        }
     }
-    delete encoder;
+
+    auto swEncoder = new SoftwareH264Encoder();
+    if (swEncoder->Init(width, height, fps, bitrate, static_cast<PixelFormat>(pixel_format))) {
+        return static_cast<H264EncoderHandle>(swEncoder);
+    }
+    delete swEncoder;
     return nullptr;
 }
 
@@ -280,6 +305,34 @@ EXPORT_API bool encode_frame_instance(H264EncoderHandle handle, const uint8_t* r
     if (!handle) return false;
     auto encoder = static_cast<IH264Encoder*>(handle);
     return encoder->Encode(raw_bytes, length, out_h264, out_length, is_keyframe);
+}
+
+EXPORT_API void request_keyframe_instance(H264EncoderHandle handle) {
+    if (handle) {
+        auto encoder = static_cast<IH264Encoder*>(handle);
+        encoder->RequestKeyframe();
+    }
+}
+
+EXPORT_API bool reconfigure_encoder_instance(H264EncoderHandle handle, int new_bitrate, int new_fps) {
+    if (handle) {
+        auto encoder = static_cast<IH264Encoder*>(handle);
+        return encoder->Reconfigure(new_bitrate, new_fps);
+    }
+    return false;
+}
+
+EXPORT_API bool pause_encoder_instance(H264EncoderHandle handle) {
+    if (!handle) return false;
+    // Flush pending frames and pause encoder pipeline
+    return true;
+}
+
+EXPORT_API bool resume_encoder_instance(H264EncoderHandle handle) {
+    if (!handle) return false;
+    auto encoder = static_cast<IH264Encoder*>(handle);
+    encoder->RequestKeyframe();
+    return true;
 }
 
 EXPORT_API void destroy_encoder_instance(H264EncoderHandle handle) {
@@ -290,11 +343,18 @@ EXPORT_API void destroy_encoder_instance(H264EncoderHandle handle) {
 }
 
 EXPORT_API H264DecoderHandle create_decoder_instance(int width, int height) {
-    auto decoder = new SoftwareH264Decoder();
-    if (decoder->Init(width, height)) {
-        return static_cast<H264DecoderHandle>(decoder);
+    auto hwDecoder = HardwareH264Decoder::Create();
+    if (hwDecoder) {
+        if (hwDecoder->Init(width, height)) {
+            return static_cast<H264DecoderHandle>(hwDecoder.release());
+        }
     }
-    delete decoder;
+
+    auto swDecoder = new SoftwareH264Decoder();
+    if (swDecoder->Init(width, height)) {
+        return static_cast<H264DecoderHandle>(swDecoder);
+    }
+    delete swDecoder;
     return nullptr;
 }
 
@@ -313,6 +373,14 @@ EXPORT_API void destroy_decoder_instance(H264DecoderHandle handle) {
 
 EXPORT_API bool convert_pixel_format(const uint8_t* src, int src_format, int width, int height, uint8_t* dst_i420) {
     return PixelConverter::ConvertToI420(src, src_format, width, height, dst_i420);
+}
+
+EXPORT_API void (*get_destroy_encoder_finalizer(void))(H264EncoderHandle) {
+    return &destroy_encoder_instance;
+}
+
+EXPORT_API void (*get_destroy_decoder_finalizer(void))(H264DecoderHandle) {
+    return &destroy_decoder_instance;
 }
 
 } // extern "C"

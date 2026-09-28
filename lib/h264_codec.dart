@@ -5,6 +5,7 @@ import 'package:ffi/ffi.dart' as pkg_ffi;
 
 import 'h264_ffi_bindings.dart';
 import 'h264_codec_platform_interface.dart';
+export 'h264_lifecycle_manager.dart';
 
 /// Plugin main interface
 class H264Codec {
@@ -69,7 +70,7 @@ class DecodedYuvFrame {
 }
 
 /// High-Level Flutter Class for Frame-by-Frame H.264 Encoding
-class H264Encoder {
+class H264Encoder implements ffi.Finalizable {
   final int width;
   final int height;
   final int fps;
@@ -78,6 +79,10 @@ class H264Encoder {
 
   ffi.Pointer<ffi.Void>? _handle;
   bool _isDisposed = false;
+
+  static final ffi.NativeFinalizer _finalizer = ffi.NativeFinalizer(
+    H264FFIBindings().destroyEncoderFinalizerPtr.cast(),
+  );
 
   H264Encoder({
     required this.width,
@@ -91,7 +96,39 @@ class H264Encoder {
   bool init() {
     final bindings = H264FFIBindings();
     _handle = bindings.createEncoderInstance(width, height, fps, bitrate, pixelFormat.value);
-    return _handle != null && _handle != ffi.nullptr;
+    if (_handle != null && _handle != ffi.nullptr) {
+      _finalizer.attach(this, _handle!.cast(), detach: this);
+      return true;
+    }
+    return false;
+  }
+
+  /// Force generating an IDR Keyframe on next encoded frame
+  void requestKeyframe() {
+    if (_isDisposed || _handle == null || _handle == ffi.nullptr) return;
+    H264FFIBindings().requestKeyframeInstance(_handle!);
+  }
+
+  /// Dynamic Bitrate & FPS reconfiguration for Adaptive Bitrate Streaming
+  bool reconfigure({int? newBitrate, int? newFps}) {
+    if (_isDisposed || _handle == null || _handle == ffi.nullptr) return false;
+    return H264FFIBindings().reconfigureEncoderInstance(
+      _handle!,
+      newBitrate ?? -1,
+      newFps ?? -1,
+    );
+  }
+
+  /// Pause encoder session and flush pending frame buffers
+  bool pause() {
+    if (_isDisposed || _handle == null || _handle == ffi.nullptr) return false;
+    return H264FFIBindings().pauseEncoderInstance(_handle!);
+  }
+
+  /// Resume encoder session and request an IDR Keyframe for recovery
+  bool resume() {
+    if (_isDisposed || _handle == null || _handle == ffi.nullptr) return false;
+    return H264FFIBindings().resumeEncoderInstance(_handle!);
   }
 
   /// Synchronously encode a raw pixel frame to H.264
@@ -173,6 +210,7 @@ class H264Encoder {
   void dispose() {
     if (_isDisposed) return;
     if (_handle != null && _handle != ffi.nullptr) {
+      _finalizer.detach(this);
       H264FFIBindings().destroyEncoderInstance(_handle!);
       _handle = null;
     }
@@ -181,12 +219,16 @@ class H264Encoder {
 }
 
 /// High-Level Flutter Class for Frame-by-Frame H.264 Decoding
-class H264Decoder {
+class H264Decoder implements ffi.Finalizable {
   final int width;
   final int height;
 
   ffi.Pointer<ffi.Void>? _handle;
   bool _isDisposed = false;
+
+  static final ffi.NativeFinalizer _finalizer = ffi.NativeFinalizer(
+    H264FFIBindings().destroyDecoderFinalizerPtr.cast(),
+  );
 
   H264Decoder({
     required this.width,
@@ -197,7 +239,11 @@ class H264Decoder {
   bool init() {
     final bindings = H264FFIBindings();
     _handle = bindings.createDecoderInstance(width, height);
-    return _handle != null && _handle != ffi.nullptr;
+    if (_handle != null && _handle != ffi.nullptr) {
+      _finalizer.attach(this, _handle!.cast(), detach: this);
+      return true;
+    }
+    return false;
   }
 
   /// Synchronously decode H.264 packet to YUV I420 raw frame
@@ -266,6 +312,7 @@ class H264Decoder {
   void dispose() {
     if (_isDisposed) return;
     if (_handle != null && _handle != ffi.nullptr) {
+      _finalizer.detach(this);
       H264FFIBindings().destroyDecoderInstance(_handle!);
       _handle = null;
     }

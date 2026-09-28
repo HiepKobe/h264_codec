@@ -45,7 +45,7 @@ android {
     }
 
     defaultConfig {
-        minSdk = 24
+        minSdk = 26
         externalNativeBuild {
             cmake {
                 cppFlags("-std=c++17")
